@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from rotary_embedding_torch import RotaryEmbedding
 
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional
 
 class MSR(nn.Module):
     def __init__(self,
@@ -93,14 +93,13 @@ class RetNetBlock(nn.Module):
         self.ln2 = nn.LayerNorm(hidden_dim)
         self.ffn = FFN(hidden_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Eq. (9)
-        if self.training:
-            y, _ = self.msr(self.ln1(x))
-            y = y + x
-            return self.ffn(self.ln2(y)) + y
+    def forward(self, x: torch.Tensor, hidden_state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Eq. (9)        
+        y, hidden_state = self.msr(self.ln1(x), hidden_state)
+        y = y + x
+        return self.ffn(self.ln2(y)) + y, hidden_state
 
-class RetentionNetwork(pl.LightningModule):
+class RetentionNetwork(nn.Module):
     def __init__(self,
                  vocab_size: int,
                  hidden_dim: int,
@@ -110,19 +109,57 @@ class RetentionNetwork(pl.LightningModule):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, hidden_dim)
         self.layers = nn.ModuleList([RetNetBlock(hidden_dim=hidden_dim, head_dim=head_dim) for i in range(n_layers)])
-        
+
     def forward(self, x: torch.LongTensor) -> torch.Tensor:
         x = self.emb(x)
+        hidden_state: torch.Tensor = None
+
         for layer in self.layers:
-            x: torch.Tensor = layer(x)
+            x, hidden_state = layer(x, hidden_state)
 
         return x
 
+class RetNetClassification(pl.LightningModule):
+    def __init__(self,
+                 vocab_size: int,
+                 hidden_dim: int,
+                 n_layers: int,
+                 head_dim: int = 256,
+                 max_seqlen: int = 512,
+                 num_classes: int = 2,
+                 *,
+                 lr = 0.0001,
+                 betas = (0.9, 0.98),
+                 weight_decay = 0.05
+                 ):
+        super().__init__()     
+
+        self.retnet = RetentionNetwork(vocab_size=vocab_size, hidden_dim=hidden_dim, n_layers=n_layers, head_dim=head_dim)   
+        self.head = nn.Linear(max_seqlen * hidden_dim, num_classes)
+
+        self.lr = lr
+        self.betas = betas
+        self.weight_decay = weight_decay        
+
+    def forward(self, x: torch.LongTensor) -> torch.Tensor:
+        return self.retnet(x)
+    
+    def configure_optimizers(self):
+        optim = torch.optim.AdamW([self.retnet.parameters(), self.head.parameters()], 
+                                  lr=self.lr, 
+                                  betas=self.betas, 
+                                  weight_decay=self.weight_decay
+                                  )
+        return optim
+    
+    def training_step(self, batch, batch_idx):
+        pass
+
 if __name__=='__main__':
-    model = RetentionNetwork(vocab_size=10, hidden_dim=256, n_layers=3, head_dim=32)
+    model = RetNetClassification(vocab_size=10, hidden_dim=256, n_layers=3, head_dim=32)    
     # model = MSR(256, 32)
     # model = model.eval()
-    x = torch.zeros(1, 10, dtype=torch.long)
+    x = torch.zeros(1, 512, dtype=torch.long)
     y = model(x)
     print(x.shape, y.shape)
 
