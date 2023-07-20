@@ -10,12 +10,11 @@ from rotary_embedding_torch import RotaryEmbedding
 
 from typing import Tuple, Optional
 
-# Implementation of https://arxiv.org/pdf/2307.08621.pdf
 class MSR(nn.Module):
     def __init__(self,
                  hidden_dim: int,
                  head_dim: int,
-                 ):
+                 ):        
         super().__init__()
 
         self.n_heads = n_heads = hidden_dim // head_dim
@@ -50,6 +49,7 @@ class MSR(nn.Module):
         if self.training:
             # Eq. (5) 
             # Dnm = pow(gamma, n-m) if n>=m else 0
+            # TODO: implement Retention Score normalization
             nm_index = torch.arange(1, seqlen+1)
             nm = repeat(nm_index, 'W -> W H', H=seqlen) - repeat(nm_index, 'W -> H W', H=seqlen)
             decay_mask = torch.pow(self.gamma.view(-1, 1, 1), nm) * (nm >= 0).int()
@@ -72,18 +72,59 @@ class MSR(nn.Module):
         y = self.wo(y)
         
         return y, hidden_state
-    
-class RetentionNetwork(pl.LightningModule):
-    def __init__(self):
+
+class FFN(nn.Module):
+    def __init__(self, hidden_dim: int,):
+        super().__init__()
+        self.w1 = nn.Linear(hidden_dim, hidden_dim)
+        self.w2 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.act(self.w1(x)))
+
+class RetNetBlock(nn.Module):
+    def __init__(self, hidden_dim: int, 
+                 head_dim: int,):
         super().__init__()
 
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.msr = MSR(hidden_dim=hidden_dim, head_dim=head_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.ffn = FFN(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Eq. (9)
+        if self.training:
+            y, _ = self.msr(self.ln1(x))
+            y = y + x
+            return self.ffn(self.ln2(y)) + y
+
+class RetentionNetwork(pl.LightningModule):
+    def __init__(self,
+                 vocab_size: int,
+                 hidden_dim: int,
+                 n_layers: int,
+                 head_dim: int = 256,
+                 ):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, hidden_dim)
+        self.layers = nn.ModuleList([RetNetBlock(hidden_dim=hidden_dim, head_dim=head_dim) for i in range(n_layers)])
+        
+    def forward(self, x: torch.LongTensor) -> torch.Tensor:
+        x = self.emb(x)
+        for layer in self.layers:
+            x: torch.Tensor = layer(x)
+
+        return x
+
 if __name__=='__main__':
-    # model = RetentionNetwork()
-    model = MSR(256, 32)
+    model = RetentionNetwork(vocab_size=10, hidden_dim=256, n_layers=3, head_dim=32)
+    # model = MSR(256, 32)
     # model = model.eval()
-    x = torch.zeros(1, 10, 256)
-    y, _ = model(x)
-    print(y.shape)
+    x = torch.zeros(1, 10, dtype=torch.long)
+    y = model(x)
+    print(x.shape, y.shape)
 
     # trainer = pl.Trainer()
 
